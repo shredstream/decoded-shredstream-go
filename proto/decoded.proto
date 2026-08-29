@@ -1,0 +1,21 @@
+// Decoded ShredStream — gRPC contract (ShredStream.com).
+//
+// Streams pre-execution Solana transactions decoded from shreds. The request/response
+// messages are the market-standard `shreder_binary` messages, byte-for-byte:
+// an existing market-standard client only needs to change its endpoint.
+//
+// Subscription model: bidirectional stream. Send at least one request with a
+// named-filter map; the server tags each response with the names of the
+// filters that matched. The map can be replaced mid-stream (no reconnect, no
+// gap). An empty map delivers nothing; a named but EMPTY filter matches
+// everything.
+syntax = "proto3";
+
+package shredstream.com;
+
+import "shreder_binary.proto";
+
+service DecodedShredStreamService {
+  rpc SubscribeDecodedTransactions(stream shreder_binary.SubscribeBinaryTransactionsRequest)
+      returns (stream shreder_binary.SubscribeBinaryTransactionsResponse);
+}
