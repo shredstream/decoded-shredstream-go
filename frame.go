@@ -34,7 +34,7 @@ var (
 	ErrBadMagic           = &FrameError{"bad_magic", "wrong magic — not a stream frame"}
 	ErrUnsupportedVersion = &FrameError{"unsupported_version", "unknown frame version — upgrade the client"}
 	ErrTruncated          = &FrameError{"truncated", "payload ended mid-field"}
-	ErrBadFragment        = &FrameError{"bad_fragment", "transaction frames are never fragmented"}
+	ErrBadFragment        = &FrameError{"bad_fragment", "inconsistent fragmentation fields, or a fragment lost or out of order"}
 )
 
 func ParseHeader(buf []byte) (FrameHeader, *FrameError) {
@@ -65,10 +65,26 @@ const (
 	PushError
 )
 
+type reassembler struct {
+	buf         []byte
+	fragCount   byte
+	expectIndex byte
+	lastSeq     uint64
+	active      bool
+}
+
+func (r *reassembler) reset() {
+	r.buf = r.buf[:0]
+	r.fragCount = 0
+	r.expectIndex = 0
+	r.lastSeq = 0
+	r.active = false
+}
+
 type StreamDecoder struct {
-	seqInit bool
-	stats   *counters
-	hook    *noticeHook
+	reasm reassembler
+	stats *counters
+	hook  *noticeHook
 }
 
 func NewStreamDecoder() *StreamDecoder {
@@ -92,20 +108,56 @@ func (d *StreamDecoder) Push(datagram []byte) (update *TransactionUpdate, res Pu
 		return nil, PushError, herr
 	}
 
-	d.seqInit = true
-
 	if header.MsgType != MsgTransaction {
 		d.stats.skippedMsgType.Add(1)
 		return nil, PushSkipped, nil
 	}
 
-	if header.FragCount != 1 {
+	payload := datagram[FrameHeaderLen:]
+
+	if header.FragCount == 1 {
+		d.reasm.reset()
+		return d.complete(payload)
+	}
+
+	if header.FragCount == 0 || header.FragIndex >= header.FragCount {
 		d.stats.decodeErrors.Add(1)
 		d.hook.fire(Notice{Kind: NoticeDecodeError})
 		return nil, PushError, ErrBadFragment
 	}
 
-	payload := datagram[FrameHeaderLen:]
+	if header.FragIndex == 0 {
+		d.reasm.reset()
+		d.reasm.active = true
+		d.reasm.fragCount = header.FragCount
+		d.reasm.expectIndex = 1
+		d.reasm.lastSeq = header.Seq
+		d.reasm.buf = append(d.reasm.buf, payload...)
+		return nil, PushSkipped, nil
+	}
+
+	if !d.reasm.active ||
+		d.reasm.fragCount != header.FragCount ||
+		header.FragIndex != d.reasm.expectIndex ||
+		header.Seq != d.reasm.lastSeq+1 {
+		d.reasm.reset()
+		d.stats.decodeErrors.Add(1)
+		d.hook.fire(Notice{Kind: NoticeDecodeError})
+		return nil, PushError, ErrBadFragment
+	}
+	d.reasm.buf = append(d.reasm.buf, payload...)
+	d.reasm.lastSeq = header.Seq
+	d.reasm.expectIndex++
+
+	if header.FragIndex+1 == header.FragCount {
+		update, res, err := d.complete(d.reasm.buf)
+		d.reasm.reset()
+		return update, res, err
+	}
+	return nil, PushSkipped, nil
+}
+
+func (d *StreamDecoder) complete(payload []byte) (*TransactionUpdate, PushResult, *FrameError) {
 	if len(payload) < 8 {
 		d.stats.decodeErrors.Add(1)
 		d.hook.fire(Notice{Kind: NoticeDecodeError})

@@ -1,8 +1,27 @@
 package decodedshredstream
 
-import "errors"
+import (
+	"encoding/binary"
+	"errors"
+)
 
 var ErrMalformedMessage = errors.New("malformed transaction message")
+
+const (
+	txV1Marker      = 0x81
+	v1MinMessageLen = 42
+)
+
+func v1MessageLen(tx []byte) (int, bool) {
+	if len(tx) < v1MinMessageLen {
+		return 0, false
+	}
+	n := len(tx) - 64*int(tx[1])
+	if n < v1MinMessageLen {
+		return 0, false
+	}
+	return n, true
+}
 
 type CompiledInstruction struct {
 	ProgramIndex   uint8
@@ -54,6 +73,9 @@ func shortvec(b []byte, off int) (value, size int, ok bool) {
 func DecodeMessage(buf []byte) (*CompiledMessage, error) {
 	if len(buf) == 0 {
 		return nil, ErrMalformedMessage
+	}
+	if buf[0] == txV1Marker {
+		return decodeMessageV1(buf)
 	}
 	o := 0
 
@@ -163,7 +185,72 @@ func DecodeMessage(buf []byte) (*CompiledMessage, error) {
 	return m, nil
 }
 
+func decodeMessageV1(buf []byte) (*CompiledMessage, error) {
+	if len(buf) < v1MinMessageLen {
+		return nil, ErrMalformedMessage
+	}
+	m := &CompiledMessage{
+		Version: 1,
+		Header: MessageHeader{
+			NumRequiredSignatures: buf[1],
+			NumReadonlySigned:     buf[2],
+			NumReadonlyUnsigned:   buf[3],
+		},
+		LifetimeToken: buf[8:40],
+	}
+	mask := binary.LittleEndian.Uint32(buf[4:8])
+	nIx := int(buf[40])
+	nAddr := int(buf[41])
+	o := 42
+
+	if o+nAddr*32 > len(buf) {
+		return nil, ErrMalformedMessage
+	}
+	m.StaticAccounts = make([][]byte, nAddr)
+	for i := range m.StaticAccounts {
+		m.StaticAccounts[i] = buf[o : o+32]
+		o += 32
+	}
+
+	if mask&0b11 == 0b11 {
+		o += 8
+	}
+	for bit := 2; bit <= 4; bit++ {
+		if mask&(1<<bit) != 0 {
+			o += 4
+		}
+	}
+
+	if o+nIx*4 > len(buf) {
+		return nil, ErrMalformedMessage
+	}
+	p := o + nIx*4
+	m.Instructions = make([]CompiledInstruction, nIx)
+	for i := range m.Instructions {
+		na := int(buf[o+1])
+		nd := int(binary.LittleEndian.Uint16(buf[o+2 : o+4]))
+		if p+na+nd > len(buf) {
+			return nil, ErrMalformedMessage
+		}
+		m.Instructions[i] = CompiledInstruction{
+			ProgramIndex:   buf[o],
+			AccountIndices: buf[p : p+na],
+			Data:           buf[p+na : p+na+nd],
+		}
+		o += 4
+		p += na + nd
+	}
+	return m, nil
+}
+
 func MessageBytes(tx []byte) ([]byte, error) {
+	if len(tx) > 0 && tx[0] == txV1Marker {
+		n, ok := v1MessageLen(tx)
+		if !ok {
+			return nil, ErrMalformedMessage
+		}
+		return tx[:n], nil
+	}
 	n, sz, ok := shortvec(tx, 0)
 	if !ok || sz+n*64 > len(tx) {
 		return nil, ErrMalformedMessage

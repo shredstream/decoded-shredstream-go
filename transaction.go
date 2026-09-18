@@ -44,6 +44,14 @@ func (u *TransactionUpdate) Signature() (Signature, bool) {
 		copy(sig[:], u.protoSigs[0])
 		return sig, true
 	}
+	if len(u.bytes) > 0 && u.bytes[0] == txV1Marker {
+		start, ok := v1MessageLen(u.bytes)
+		if !ok || u.bytes[1] < 1 {
+			return Signature{}, false
+		}
+		copy(sig[:], u.bytes[start:start+64])
+		return sig, true
+	}
 	count, prefix, ok := shortvecLen(u.bytes)
 	if !ok || count < 1 || len(u.bytes) < prefix+64 {
 		return Signature{}, false
@@ -63,6 +71,18 @@ func (u *TransactionUpdate) Signatures() []Signature {
 				var s Signature
 				copy(s[:], raw)
 				sigs = append(sigs, s)
+			}
+			u.sigs = sigs
+			return
+		}
+		if len(u.bytes) > 0 && u.bytes[0] == txV1Marker {
+			start, ok := v1MessageLen(u.bytes)
+			if !ok || u.bytes[1] < 1 {
+				return
+			}
+			sigs := make([]Signature, u.bytes[1])
+			for i := range sigs {
+				copy(sigs[i][:], u.bytes[start+i*64:])
 			}
 			u.sigs = sigs
 			return
